@@ -1,0 +1,145 @@
+alias: "Shutter Master V3 – Sonnen-, Temperatur-, Wind-, Regen- & Nachtkühl-Logik"
+id: shutter_master_v3
+description: |
+  Automatische Rollladensteuerung basierend auf:
+    – Sonnenintensität & Temperatur
+    – Positionsprofile je nach Sonnenstand (Azimut/Elevation)
+    – Nachtkühlung (nachts öffnen wenn draußen kühler als innen)
+    – Windschutz & Regenschutz
+    – Hysterese gegen ständiges Auf/Abfahren
+    – 2-Minuten-Stabilitätslogik
+mode: single
+
+trigger:
+  - platform: state
+    entity_id:
+      - sensor.remshalden_buoch_solar_irradiance
+      - sensor.aqara_temp_hum_wohnzimmer_temperature
+      - sensor.remshalden_buoch_outside_temperature
+      - sensor.remshalden_buoch_wind_gust
+      - sensor.remshalden_buoch_rain_intensity
+  - platform: state
+    entity_id: sun.sun
+    attribute: elevation
+
+condition:
+  - condition: state
+    entity_id: input_boolean.rollladenautomationen
+    state: "on"
+
+action:
+  - variables:
+      solar_value: "{{ states('sensor.remshalden_buoch_solar_irradiance') | float(0) }}"
+      temp_inside: "{{ states('sensor.aqara_temp_hum_wohnzimmer_temperature') | float(0) }}"
+      temp_outside: "{{ states('sensor.remshalden_buoch_outside_temperature') | float(0) }}"
+      sun_elev: "{{ state_attr('sun.sun','elevation') | float(0) }}"
+      wind_ok: "{{ states('sensor.remshalden_buoch_wind_gust') | float(0) < 40 }}"
+      raining: "{{ states('sensor.remshalden_buoch_rain_intensity') | float(0) > 0 }}"
+      last_run: "{{ states('input_number.last_shutter_run') | float(0) }}"
+      now_ts: "{{ now().timestamp() | float }}"
+      can_run: "{{ (now_ts - last_run) >= 180 }}"
+
+  # --- Hysterese blockieren ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ not can_run }}"
+        sequence:
+          - stop: "Hysterese aktiv – Warte 3 Minuten"
+
+  # --- Wind/Regenschutz ---
+      - conditions:
+          - condition: template
+            value_template: "{{ not wind_ok or raining }}"
+        sequence:
+          - service: cover.set_cover_position
+            target:
+              entity_id:
+                - cover.rollladen_1
+                - cover.rollladen_3
+                - cover.rollladen_4
+                - cover.rollladen_5
+            data:
+              position: 100
+          - stop: "Wind/Regenschutz aktiv"
+
+  # --- Nachtkühlung ---
+  - choose:
+      - conditions:
+          - condition: template
+            value_template: "{{ sun_elev < 0 and (temp_outside - temp_inside) < -4 }}"
+        sequence:
+          - service: cover.set_cover_position
+            target:
+              entity_id:
+                - cover.rollladen_1
+                - cover.rollladen_3
+                - cover.rollladen_4
+                - cover.rollladen_5
+            data:
+              position: 25
+          - stop: "Nachtkühlung aktiv"
+
+  # --- Sonnenschutz-Modus bestimmen ---
+  - variables:
+      mode: >-
+        {% if solar_value > 900 and temp_inside > 28 %}
+          high
+        {% elif solar_value > 750 and temp_inside > 26 %}
+          mid
+        {% elif solar_value > 500 and temp_inside > 24 %}
+          low
+        {% elif solar_value > 250 %}
+          very_low
+        {% else %}
+          off
+        {% endif %}
+
+      sun_group: >-
+        {% if sun_elev < 10 %}
+          very_low
+        {% elif sun_elev < 35 %}
+          low
+        {% elif sun_elev < 50 %}
+          mid
+        {% else %}
+          high
+        {% endif %}
+
+  # --- Positionsprofile ---
+  - variables:
+      pos_very_low: [80, 80, 80, 90]
+      pos_low: [80, 80, 80, 90]
+      pos_mid: [80, 60, 60, 80]
+      pos_high: [80, 40, 40, 40]
+
+      setpos: >-
+        {% if sun_group == 'very_low' %}
+          {{ pos_very_low }}
+        {% elif sun_group == 'low' %}
+          {{ pos_low }}
+        {% elif sun_group == 'mid' %}
+          {{ pos_mid }}
+        {% else %}
+          {{ pos_high }}
+        {% endif %}
+
+      covers: >
+        ['cover.rollladen_1','cover.rollladen_3','cover.rollladen_4','cover.rollladen_5']
+
+  # --- Positions setzen ---
+  - repeat:
+      count: "{{ setpos | count }}"
+      sequence:
+        - service: cover.set_cover_position
+          data:
+            position: "{{ setpos[repeat.index - 1] }}"
+          target:
+            entity_id: "{{ covers[repeat.index - 1] }}"
+
+  # --- Hysterese-Zeit speichern ---
+  - service: input_number.set_value
+    target:
+      entity_id: input_number.last_shutter_run
+    data:
+      value: "{{ now().timestamp() | float }}"
